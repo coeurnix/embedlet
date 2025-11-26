@@ -12,12 +12,11 @@
  */
 
 #define EMBEDLET_IMPLEMENTATION
-#include "embedlet.h"
+#include "../include/embedlet.h"
 
 #include <assert.h>
 #include <stdio.h>
 #include <time.h>
-
 
 #define TEST_DIMS 1024
 #define TEST_NUM_FILES 150
@@ -35,7 +34,7 @@ static int load_embedding(const char *path, float *out, size_t dims) {
 
 /* Generate embedding filename */
 static void get_embedding_path(int idx, char *buf, size_t bufsize) {
-  snprintf(buf, bufsize, "embedding-%03d.dat", idx);
+  snprintf(buf, bufsize, "../sample_data/embedding-%03d.dat", idx);
 }
 
 /* Test: Open and create store */

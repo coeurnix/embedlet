@@ -12,7 +12,7 @@ embedlet lets you store millions of vector embeddings in a memory-mapped file an
 
 Modern AI models can convert almost anything—text, images, audio, code—into **embeddings**: arrays of floating-point numbers (typically 256 to 4096 dimensions) that capture semantic meaning.
 
-The magic is that **similar things have similar embeddings**. Two sentences with the same meaning will have embeddings that are mathematically close together, even if they use completely different words.
+The key is that **similar things have similar embeddings**. Two sentences with the same meaning will have embeddings that are mathematically close together, even if they use completely different words.
 
 This enables powerful applications:
 
@@ -26,7 +26,7 @@ This enables powerful applications:
 | **Image Search** | Find visually similar images |
 | **Anomaly Detection** | Find outliers that don't match the pattern |
 
-embedlet handles the storage and similarity search part—you bring the embeddings from your favorite model (OpenAI, Cohere, Sentence Transformers, CLIP, etc.).
+embedlet handles the storage and similarity search part—you bring the embeddings from your favorite model (Qwen, OpenAI, Gemini, Voyage, etc.).
 
 ---
 
@@ -640,7 +640,7 @@ Use `-march=native` for local builds to auto-detect.
 ### Dimensionality
 
 - Higher dimensions = more accurate similarity but slower search
-- Common sizes: 384 (MiniLM), 768 (BERT), 1536 (OpenAI ada-002), 3072 (OpenAI large)
+- Common sizes: 384, 768, 1024, 1536, 3072
 - embedlet handles any dimension efficiently due to SIMD
 
 ### Memory Usage
@@ -763,7 +763,7 @@ For more information, see [unlicense.org](http://unlicense.org/) or the `UNLICEN
 
 ## Author
 
-**coeurnix**
+coeurnix
 
 ---
 

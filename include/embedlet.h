@@ -44,7 +44,6 @@ extern "C" {
 #include <stdlib.h>
 #include <string.h>
 
-
 #if EMBEDLET_WINDOWS
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -459,6 +458,26 @@ static embedlet_pool_t *embedlet_pool_create(int num_threads) {
     pool->threads[i] =
         CreateThread(NULL, 0, embedlet_pool_worker, pool, 0, NULL);
   }
+
+  /* Check if all threads were created successfully */
+  int threads_ok = 1;
+  for (int i = 0; i < num_threads; i++) {
+    if (pool->threads[i] == NULL) {
+      threads_ok = 0;
+      break;
+    }
+  }
+  if (!threads_ok) {
+    for (int i = 0; i < num_threads; i++) {
+      if (pool->threads[i] != NULL) {
+        CloseHandle(pool->threads[i]);
+      }
+    }
+    DeleteCriticalSection(&pool->mutex);
+    free(pool->threads);
+    free(pool);
+    return NULL;
+  }
 #else
   pthread_mutex_init(&pool->mutex, NULL);
   pthread_cond_init(&pool->cond_work, NULL);
@@ -472,7 +491,21 @@ static embedlet_pool_t *embedlet_pool_create(int num_threads) {
     return NULL;
   }
   for (int i = 0; i < num_threads; i++) {
-    pthread_create(&pool->threads[i], NULL, embedlet_pool_worker, pool);
+    int ret =
+        pthread_create(&pool->threads[i], NULL, embedlet_pool_worker, pool);
+    if (ret != 0) {
+      /* Failure: cancel and join previously created threads */
+      for (int j = 0; j < i; j++) {
+        pthread_cancel(pool->threads[j]);
+        pthread_join(pool->threads[j], NULL);
+      }
+      pthread_mutex_destroy(&pool->mutex);
+      pthread_cond_destroy(&pool->cond_work);
+      pthread_cond_destroy(&pool->cond_done);
+      free(pool->threads);
+      free(pool);
+      return NULL;
+    }
   }
 #endif
 
