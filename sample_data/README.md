@@ -1,0 +1,3 @@
+This contains 150 embeddings in the form of raw 1024-dimension float32 vectors, stored individually as `embedding-000.dat` through `embedding-149.dat`. Their source sentences are given in the `source.json` file.
+
+These were generated with [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) using the `create_embeddings.py` script in this directory. You can re-run this, if needed, to regenerate them.
