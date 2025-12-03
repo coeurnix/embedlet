@@ -5,12 +5,21 @@
  * embeddings.
  *
  * Provides storage, retrieval, and similarity search for fixed-dimensional
- * float32 embeddings using memory-mapped files. Supports AVX-512, AVX2, SSE,
- * and pure C fallback paths. Thread-safe with optional multithreaded queries.
+ * float32 embeddings using memory-mapped files. Thread-safe with optional
+ * multithreaded queries. Uses a portable C implementation with optional
+ * SSE2 acceleration when available.
  *
- * Usage:
+ * Basic Usage:
  *   #define EMBEDLET_IMPLEMENTATION
  *   #include "embedlet.h"
+ *
+ * Build Instructions:
+ *
+ *   MSVC:
+ *     cl /O2 /DEMBEDLET_IMPLEMENTATION your_program.c
+ *
+ *   GCC/Clang:
+ *     gcc -O3 -DEMBEDLET_IMPLEMENTATION your_program.c -o your_program -lm
  */
 
 #ifndef EMBEDLET_H
@@ -48,50 +57,22 @@ extern "C" {
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <intrin.h>
 #include <windows.h>
-
 #else
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#if defined(__x86_64__) || defined(__i386__)
-#include <cpuid.h>
-#endif
 #endif
 
-/* SIMD headers - include based on compiler support */
-#if defined(__AVX512F__)
-#include <immintrin.h>
-#define EMBEDLET_HAS_AVX512 1
-#else
-#define EMBEDLET_HAS_AVX512 0
-#endif
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#define EMBEDLET_HAS_AVX2 1
-#else
-#define EMBEDLET_HAS_AVX2 0
-#endif
-
-#if defined(__SSE4_2__) || defined(__SSE2__)
+/* Optional SSE2 acceleration */
+#if defined(__SSE2__) ||                                                       \
+    (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)))
 #include <emmintrin.h>
-#if defined(__SSE4_1__)
-#include <smmintrin.h>
-#endif
-#define EMBEDLET_HAS_SSE 1
+#define EMBEDLET_HAS_SSE2 1
 #else
-#define EMBEDLET_HAS_SSE 0
-#endif
-
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-#include <intrin.h>
-#ifndef EMBEDLET_HAS_SSE
-#define EMBEDLET_HAS_SSE 1
-#endif
+#define EMBEDLET_HAS_SSE2 0
 #endif
 
 /*============================================================================
@@ -230,9 +211,9 @@ float embedlet_similarity_raw(const float *a, const float *b, size_t dims);
  * @param n            Number of results to return.
  * @param most_similar If true, return most similar; if false, least similar.
  * @param num_threads  Thread count: EMBEDLET_AUTO_THREADS,
- * EMBEDLET_SINGLE_THREAD, or specific count.
+ *                     EMBEDLET_SINGLE_THREAD, or specific count.
  * @param results      Array of n embedlet_result_t to receive results (sorted
- * by score).
+ *                     by score).
  * @param count_out    Pointer to receive actual number of results (may be < n).
  * @return EMBEDLET_OK on success, error code otherwise.
  */
@@ -271,18 +252,17 @@ typedef CRITICAL_SECTION embedlet_mutex_t;
 typedef pthread_mutex_t embedlet_mutex_t;
 #endif
 
-/* Thread pool work item */
 typedef struct embedlet_work {
   void (*func)(void *arg);
   void *arg;
   struct embedlet_work *next;
 } embedlet_work_t;
 
-/* Thread pool */
 typedef struct embedlet_pool {
   int num_threads;
   volatile bool shutdown;
   volatile int active_count;
+  volatile int pending_count;
   embedlet_work_t *work_head;
   embedlet_work_t *work_tail;
 #if EMBEDLET_WINDOWS
@@ -298,11 +278,10 @@ typedef struct embedlet_pool {
 #endif
 } embedlet_pool_t;
 
-/* Main store structure */
 struct embedlet_store {
   size_t dims;
-  size_t capacity;  /* Current mapped capacity in bytes */
-  size_t file_size; /* Actual file size in bytes */
+  size_t capacity;
+  size_t file_size;
   float *data;
   char *path;
   embedlet_mutex_t mutex;
@@ -315,7 +294,6 @@ struct embedlet_store {
 #endif
 };
 
-/* Search task for parallel execution */
 typedef struct {
   const embedlet_store_t *store;
   const float *query;
@@ -417,15 +395,17 @@ static void *embedlet_pool_worker(void *arg) {
 #if EMBEDLET_WINDOWS
       EnterCriticalSection(&pool->mutex);
       pool->active_count--;
-      if (pool->active_count == 0 && pool->work_head == NULL) {
-        WakeConditionVariable(&pool->cond_done);
+      pool->pending_count--;
+      if (pool->pending_count == 0 && pool->active_count == 0) {
+        WakeAllConditionVariable(&pool->cond_done);
       }
       LeaveCriticalSection(&pool->mutex);
 #else
       pthread_mutex_lock(&pool->mutex);
       pool->active_count--;
-      if (pool->active_count == 0 && pool->work_head == NULL) {
-        pthread_cond_signal(&pool->cond_done);
+      pool->pending_count--;
+      if (pool->pending_count == 0 && pool->active_count == 0) {
+        pthread_cond_broadcast(&pool->cond_done);
       }
       pthread_mutex_unlock(&pool->mutex);
 #endif
@@ -434,6 +414,9 @@ static void *embedlet_pool_worker(void *arg) {
 }
 
 static embedlet_pool_t *embedlet_pool_create(int num_threads) {
+  if (num_threads <= 0)
+    return NULL;
+
   embedlet_pool_t *pool = (embedlet_pool_t *)calloc(1, sizeof(embedlet_pool_t));
   if (!pool)
     return NULL;
@@ -441,6 +424,7 @@ static embedlet_pool_t *embedlet_pool_create(int num_threads) {
   pool->num_threads = num_threads;
   pool->shutdown = false;
   pool->active_count = 0;
+  pool->pending_count = 0;
   pool->work_head = NULL;
   pool->work_tail = NULL;
 
@@ -454,29 +438,28 @@ static embedlet_pool_t *embedlet_pool_create(int num_threads) {
     free(pool);
     return NULL;
   }
+
+  int created = 0;
   for (int i = 0; i < num_threads; i++) {
     pool->threads[i] =
         CreateThread(NULL, 0, embedlet_pool_worker, pool, 0, NULL);
-  }
-
-  /* Check if all threads were created successfully */
-  int threads_ok = 1;
-  for (int i = 0; i < num_threads; i++) {
     if (pool->threads[i] == NULL) {
-      threads_ok = 0;
-      break;
-    }
-  }
-  if (!threads_ok) {
-    for (int i = 0; i < num_threads; i++) {
-      if (pool->threads[i] != NULL) {
-        CloseHandle(pool->threads[i]);
+      EnterCriticalSection(&pool->mutex);
+      pool->shutdown = true;
+      WakeAllConditionVariable(&pool->cond_work);
+      LeaveCriticalSection(&pool->mutex);
+
+      for (int j = 0; j < created; j++) {
+        WaitForSingleObject(pool->threads[j], INFINITE);
+        CloseHandle(pool->threads[j]);
       }
+
+      DeleteCriticalSection(&pool->mutex);
+      free(pool->threads);
+      free(pool);
+      return NULL;
     }
-    DeleteCriticalSection(&pool->mutex);
-    free(pool->threads);
-    free(pool);
-    return NULL;
+    created++;
   }
 #else
   pthread_mutex_init(&pool->mutex, NULL);
@@ -494,9 +477,12 @@ static embedlet_pool_t *embedlet_pool_create(int num_threads) {
     int ret =
         pthread_create(&pool->threads[i], NULL, embedlet_pool_worker, pool);
     if (ret != 0) {
-      /* Failure: cancel and join previously created threads */
+      pthread_mutex_lock(&pool->mutex);
+      pool->shutdown = true;
+      pthread_cond_broadcast(&pool->cond_work);
+      pthread_mutex_unlock(&pool->mutex);
+
       for (int j = 0; j < i; j++) {
-        pthread_cancel(pool->threads[j]);
         pthread_join(pool->threads[j], NULL);
       }
       pthread_mutex_destroy(&pool->mutex);
@@ -530,6 +516,7 @@ static void embedlet_pool_submit(embedlet_pool_t *pool, void (*func)(void *),
     pool->work_head = work;
   }
   pool->work_tail = work;
+  pool->pending_count++;
   WakeConditionVariable(&pool->cond_work);
   LeaveCriticalSection(&pool->mutex);
 #else
@@ -540,6 +527,7 @@ static void embedlet_pool_submit(embedlet_pool_t *pool, void (*func)(void *),
     pool->work_head = work;
   }
   pool->work_tail = work;
+  pool->pending_count++;
   pthread_cond_signal(&pool->cond_work);
   pthread_mutex_unlock(&pool->mutex);
 #endif
@@ -548,13 +536,13 @@ static void embedlet_pool_submit(embedlet_pool_t *pool, void (*func)(void *),
 static void embedlet_pool_wait(embedlet_pool_t *pool) {
 #if EMBEDLET_WINDOWS
   EnterCriticalSection(&pool->mutex);
-  while (pool->active_count > 0 || pool->work_head != NULL) {
+  while (pool->pending_count > 0 || pool->active_count > 0) {
     SleepConditionVariableCS(&pool->cond_done, &pool->mutex, INFINITE);
   }
   LeaveCriticalSection(&pool->mutex);
 #else
   pthread_mutex_lock(&pool->mutex);
-  while (pool->active_count > 0 || pool->work_head != NULL) {
+  while (pool->pending_count > 0 || pool->active_count > 0) {
     pthread_cond_wait(&pool->cond_done, &pool->mutex);
   }
   pthread_mutex_unlock(&pool->mutex);
@@ -590,6 +578,13 @@ static void embedlet_pool_destroy(embedlet_pool_t *pool) {
   pthread_cond_destroy(&pool->cond_done);
 #endif
 
+  embedlet_work_t *work = pool->work_head;
+  while (work) {
+    embedlet_work_t *next = work->next;
+    free(work);
+    work = next;
+  }
+
   free(pool->threads);
   free(pool);
 }
@@ -606,138 +601,20 @@ static int embedlet_get_cpu_count(void) {
 }
 
 /*----------------------------------------------------------------------------
- * SIMD Similarity Functions
+ * Similarity Functions (C + optional SSE2)
  *----------------------------------------------------------------------------*/
 
-/* Pure C fallback */
-static float embedlet_dot_c(const float *a, const float *b, size_t n) {
-  float sum = 0.0f;
-  for (size_t i = 0; i < n; i++) {
-    sum += a[i] * b[i];
-  }
-  return sum;
-}
-
-static float embedlet_norm_c(const float *a, size_t n) {
-  float sum = 0.0f;
-  for (size_t i = 0; i < n; i++) {
-    sum += a[i] * a[i];
-  }
-  return sqrtf(sum);
-}
-
-#if EMBEDLET_HAS_AVX512
-
-static float embedlet_dot_avx512(const float *a, const float *b, size_t n) {
-  __m512 sum = _mm512_setzero_ps();
-  size_t i = 0;
-
-  for (; i + 16 <= n; i += 16) {
-    __m512 va = _mm512_loadu_ps(a + i);
-    __m512 vb = _mm512_loadu_ps(b + i);
-    sum = _mm512_fmadd_ps(va, vb, sum);
-  }
-
-  float result = _mm512_reduce_add_ps(sum);
-
-  for (; i < n; i++) {
-    result += a[i] * b[i];
-  }
-
-  return result;
-}
-
-static float embedlet_norm_avx512(const float *a, size_t n) {
-  __m512 sum = _mm512_setzero_ps();
-  size_t i = 0;
-
-  for (; i + 16 <= n; i += 16) {
-    __m512 va = _mm512_loadu_ps(a + i);
-    sum = _mm512_fmadd_ps(va, va, sum);
-  }
-
-  float result = _mm512_reduce_add_ps(sum);
-
-  for (; i < n; i++) {
-    result += a[i] * a[i];
-  }
-
-  return sqrtf(result);
-}
-
-#endif /* EMBEDLET_HAS_AVX512 */
-
-#if EMBEDLET_HAS_AVX2
-
-static float embedlet_hsum_avx(__m256 v) {
-  __m128 lo = _mm256_castps256_ps128(v);
-  __m128 hi = _mm256_extractf128_ps(v, 1);
-  lo = _mm_add_ps(lo, hi);
-  __m128 shuf = _mm_movehdup_ps(lo);
-  __m128 sums = _mm_add_ps(lo, shuf);
-  shuf = _mm_movehl_ps(shuf, sums);
-  sums = _mm_add_ss(sums, shuf);
-  return _mm_cvtss_f32(sums);
-}
-
-static float embedlet_dot_avx2(const float *a, const float *b, size_t n) {
-  __m256 sum = _mm256_setzero_ps();
-  size_t i = 0;
-
-  for (; i + 8 <= n; i += 8) {
-    __m256 va = _mm256_loadu_ps(a + i);
-    __m256 vb = _mm256_loadu_ps(b + i);
-#if defined(__FMA__)
-    sum = _mm256_fmadd_ps(va, vb, sum);
-#else
-    sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
-#endif
-  }
-
-  float result = embedlet_hsum_avx(sum);
-
-  for (; i < n; i++) {
-    result += a[i] * b[i];
-  }
-
-  return result;
-}
-
-static float embedlet_norm_avx2(const float *a, size_t n) {
-  __m256 sum = _mm256_setzero_ps();
-  size_t i = 0;
-
-  for (; i + 8 <= n; i += 8) {
-    __m256 va = _mm256_loadu_ps(a + i);
-#if defined(__FMA__)
-    sum = _mm256_fmadd_ps(va, va, sum);
-#else
-    sum = _mm256_add_ps(sum, _mm256_mul_ps(va, va));
-#endif
-  }
-
-  float result = embedlet_hsum_avx(sum);
-
-  for (; i < n; i++) {
-    result += a[i] * a[i];
-  }
-
-  return sqrtf(result);
-}
-
-#endif /* EMBEDLET_HAS_AVX2 */
-
-#if EMBEDLET_HAS_SSE
+#if EMBEDLET_HAS_SSE2
 
 static float embedlet_hsum_sse(__m128 v) {
-  __m128 shuf = _mm_movehdup_ps(v);
+  __m128 shuf = _mm_shuffle_ps(v, v, _MM_SHUFFLE(2, 3, 0, 1));
   __m128 sums = _mm_add_ps(v, shuf);
   shuf = _mm_movehl_ps(shuf, sums);
   sums = _mm_add_ss(sums, shuf);
   return _mm_cvtss_f32(sums);
 }
 
-static float embedlet_dot_sse(const float *a, const float *b, size_t n) {
+static float embedlet_dot_sse2(const float *a, const float *b, size_t n) {
   __m128 sum = _mm_setzero_ps();
   size_t i = 0;
 
@@ -756,7 +633,7 @@ static float embedlet_dot_sse(const float *a, const float *b, size_t n) {
   return result;
 }
 
-static float embedlet_norm_sse(const float *a, size_t n) {
+static float embedlet_norm_sse2(const float *a, size_t n) {
   __m128 sum = _mm_setzero_ps();
   size_t i = 0;
 
@@ -774,28 +651,35 @@ static float embedlet_norm_sse(const float *a, size_t n) {
   return sqrtf(result);
 }
 
-#endif /* EMBEDLET_HAS_SSE */
+#endif /* EMBEDLET_HAS_SSE2 */
 
-/* Dispatcher functions */
+static float embedlet_dot_c(const float *a, const float *b, size_t n) {
+  float sum = 0.0f;
+  for (size_t i = 0; i < n; i++) {
+    sum += a[i] * b[i];
+  }
+  return sum;
+}
+
+static float embedlet_norm_c(const float *a, size_t n) {
+  float sum = 0.0f;
+  for (size_t i = 0; i < n; i++) {
+    sum += a[i] * a[i];
+  }
+  return sqrtf(sum);
+}
+
 static float embedlet_dot(const float *a, const float *b, size_t n) {
-#if EMBEDLET_HAS_AVX512
-  return embedlet_dot_avx512(a, b, n);
-#elif EMBEDLET_HAS_AVX2
-  return embedlet_dot_avx2(a, b, n);
-#elif EMBEDLET_HAS_SSE
-  return embedlet_dot_sse(a, b, n);
+#if EMBEDLET_HAS_SSE2
+  return embedlet_dot_sse2(a, b, n);
 #else
   return embedlet_dot_c(a, b, n);
 #endif
 }
 
 static float embedlet_norm(const float *a, size_t n) {
-#if EMBEDLET_HAS_AVX512
-  return embedlet_norm_avx512(a, n);
-#elif EMBEDLET_HAS_AVX2
-  return embedlet_norm_avx2(a, n);
-#elif EMBEDLET_HAS_SSE
-  return embedlet_norm_sse(a, n);
+#if EMBEDLET_HAS_SSE2
+  return embedlet_norm_sse2(a, n);
 #else
   return embedlet_norm_c(a, n);
 #endif
@@ -989,18 +873,15 @@ static int embedlet_ensure_capacity(embedlet_store_t *store,
     return EMBEDLET_OK;
   }
 
-  /* Grow capacity by at least 2x or to needed size */
   size_t new_cap = store->capacity ? store->capacity * 2 : 4096;
   while (new_cap < needed_bytes) {
     new_cap *= 2;
   }
 
-  /* Resize file first */
   int err = embedlet_file_resize(store, new_cap);
   if (err != EMBEDLET_OK)
     return err;
 
-  /* Remap */
   err = embedlet_mmap_update(store, new_cap);
   if (err != EMBEDLET_OK)
     return err;
@@ -1018,7 +899,6 @@ static void embedlet_heap_push_min(embedlet_result_t *heap, size_t *size,
     heap[*size].id = id;
     heap[*size].score = score;
     (*size)++;
-    /* Bubble up */
     size_t i = *size - 1;
     while (i > 0) {
       size_t parent = (i - 1) / 2;
@@ -1032,7 +912,6 @@ static void embedlet_heap_push_min(embedlet_result_t *heap, size_t *size,
   } else if (score > heap[0].score) {
     heap[0].id = id;
     heap[0].score = score;
-    /* Bubble down */
     size_t i = 0;
     for (;;) {
       size_t left = 2 * i + 1;
@@ -1062,7 +941,6 @@ static void embedlet_heap_push_max(embedlet_result_t *heap, size_t *size,
     heap[*size].id = id;
     heap[*size].score = score;
     (*size)++;
-    /* Bubble up */
     size_t i = *size - 1;
     while (i > 0) {
       size_t parent = (i - 1) / 2;
@@ -1076,7 +954,6 @@ static void embedlet_heap_push_max(embedlet_result_t *heap, size_t *size,
   } else if (score < heap[0].score) {
     heap[0].id = id;
     heap[0].score = score;
-    /* Bubble down */
     size_t i = 0;
     for (;;) {
       size_t left = 2 * i + 1;
@@ -1096,7 +973,6 @@ static void embedlet_heap_push_max(embedlet_result_t *heap, size_t *size,
   }
 }
 
-/* Sort results by score (descending for most similar, ascending for least) */
 static int embedlet_cmp_desc(const void *a, const void *b) {
   float sa = ((const embedlet_result_t *)a)->score;
   float sb = ((const embedlet_result_t *)b)->score;
@@ -1125,7 +1001,6 @@ static void embedlet_search_worker(void *arg) {
   for (size_t i = task->start; i < task->end; i++) {
     const float *emb = store->data + i * dims;
 
-    /* Skip zeroed */
     if (embedlet_is_zeroed_ptr(emb, dims))
       continue;
 
@@ -1244,7 +1119,6 @@ int embedlet_append(embedlet_store_t *store, const float *data, bool reuse,
   size_t count = store->file_size / emb_size;
   size_t target_id = count;
 
-  /* Look for reusable slot if requested */
   if (reuse && store->data) {
     for (size_t i = 0; i < count; i++) {
       if (embedlet_is_zeroed_ptr(store->data + i * store->dims, store->dims)) {
@@ -1255,7 +1129,6 @@ int embedlet_append(embedlet_store_t *store, const float *data, bool reuse,
   }
 
   if (target_id == count) {
-    /* Need to grow file */
     size_t new_file_size = store->file_size + emb_size;
     int err = embedlet_ensure_capacity(store, new_file_size);
     if (err != EMBEDLET_OK) {
@@ -1265,7 +1138,6 @@ int embedlet_append(embedlet_store_t *store, const float *data, bool reuse,
     store->file_size = new_file_size;
   }
 
-  /* Copy data */
   memcpy(store->data + target_id * store->dims, data, emb_size);
 
   *id_out = target_id;
@@ -1359,7 +1231,6 @@ int embedlet_compact(embedlet_store_t *store) {
     return EMBEDLET_OK;
   }
 
-  /* Find last non-zero embedding */
   size_t last_nonzero = count;
   while (last_nonzero > 0) {
     if (!embedlet_is_zeroed_ptr(store->data + (last_nonzero - 1) * store->dims,
@@ -1405,7 +1276,6 @@ int embedlet_search(embedlet_store_t *store, const float *query, size_t n,
 
   float query_norm = embedlet_norm(query, store->dims);
 
-  /* Determine thread count */
   int threads = num_threads;
   if (threads == EMBEDLET_AUTO_THREADS) {
     threads = embedlet_get_cpu_count();
@@ -1417,7 +1287,6 @@ int embedlet_search(embedlet_store_t *store, const float *query, size_t n,
   if ((size_t)threads > total)
     threads = (int)total;
 
-  /* Single-threaded path */
   if (threads == 1) {
     size_t heap_size = 0;
     for (size_t i = 0; i < total; i++) {
@@ -1445,7 +1314,6 @@ int embedlet_search(embedlet_store_t *store, const float *query, size_t n,
     return EMBEDLET_OK;
   }
 
-  /* Multi-threaded path - lazy pool creation */
   embedlet_mutex_lock(&store->mutex);
   if (!store->pool) {
     store->pool = embedlet_pool_create(threads);
@@ -1457,7 +1325,6 @@ int embedlet_search(embedlet_store_t *store, const float *query, size_t n,
   embedlet_pool_t *pool = store->pool;
   embedlet_mutex_unlock(&store->mutex);
 
-  /* Allocate tasks and local result buffers */
   embedlet_search_task_t *tasks = (embedlet_search_task_t *)calloc(
       (size_t)threads, sizeof(embedlet_search_task_t));
   if (!tasks)
@@ -1491,7 +1358,6 @@ int embedlet_search(embedlet_store_t *store, const float *query, size_t n,
 
   embedlet_pool_wait(pool);
 
-  /* Merge results */
   size_t final_heap_size = 0;
   for (int i = 0; i < threads; i++) {
     for (size_t j = 0; j < tasks[i].result_count; j++) {

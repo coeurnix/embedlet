@@ -46,6 +46,7 @@ static void test_open_create(void) {
 
   embedlet_store_t *store = NULL;
   int err = embedlet_open(TEST_STORE_PATH, TEST_DIMS, &store);
+  (void)err; /* Used for assertion */
   assert(err == EMBEDLET_OK);
   assert(store != NULL);
   assert(embedlet_count(store) == 0);
@@ -73,6 +74,7 @@ static void test_append(void) {
 
   embedlet_store_t *store = NULL;
   int err = embedlet_open(TEST_STORE_PATH, TEST_DIMS, &store);
+  (void)err; /* Used for assertion */
   assert(err == EMBEDLET_OK);
 
   float *emb = (float *)malloc(TEST_DIMS * sizeof(float));
@@ -107,6 +109,7 @@ static void test_append_reuse(void) {
 
   embedlet_store_t *store = NULL;
   int err = embedlet_open(TEST_STORE_PATH, TEST_DIMS, &store);
+  (void)err; /* Used for assertion */
   assert(err == EMBEDLET_OK);
 
   float *emb = (float *)malloc(TEST_DIMS * sizeof(float));

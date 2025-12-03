@@ -209,7 +209,11 @@ int main(void) {
 
   /* === Benchmark Phase === */
   printf("\n=== Embedlet Benchmark Phase ===\n");
-  printf("Creating store with 100,000 embeddings (~409MB)\n");
+#if defined(__i386__) || defined(_M_IX86)
+  printf("Creating store with embeddings (32-bit build)\n");
+#else
+  printf("Creating store with 500,000 embeddings (~2GB)\n");
+#endif
 
   /* Remove any existing benchmark store */
   remove(STORE_PATH);
@@ -223,6 +227,14 @@ int main(void) {
   }
   printf("Benchmark store opened. Initial count: %zu\n",
          embedlet_count(bench_store));
+
+  /* Allocate new buffer for benchmark queries (previous emb was freed) */
+  emb = (float *)malloc(DIMS * sizeof(float));
+  if (!emb) {
+    fprintf(stderr, "Allocation failed\n");
+    embedlet_close(bench_store, false);
+    return 1;
+  }
 
   /* Allocate buffer for template embeddings */
   const int num_templates = 150;
@@ -244,8 +256,19 @@ int main(void) {
     }
   }
 
-  /* Fill store with 100,000 embeddings by cycling through templates */
-  const int total_embeddings = 100000;
+  /* Fill store with embeddings by cycling through templates */
+#if defined(__i386__) || defined(_M_IX86)
+  /* 32-bit build - limit to avoid exceeding 2GB address space */
+  const int total_embeddings = 200000;
+  printf("Note: 32-bit build detected, using %d embeddings to stay under 2GB "
+         "limit\n",
+         total_embeddings);
+  printf("      For full 500k benchmark, use 64-bit compiler (MinGW-w64 "
+         "x86_64)\n");
+#else
+  /* 64-bit build - use full 500k */
+  const int total_embeddings = 500000;
+#endif
   printf("Filling store with %d embeddings...\n", total_embeddings);
 
   clock_t fill_start = clock();
@@ -276,10 +299,12 @@ int main(void) {
   }
 
   /* Time single-threaded top-5 search */
-  printf("\nTiming single-threaded top-5 search...\n");
+  printf("\nTiming single-threaded top-5 search (20x)...\n");
   clock_t search_start = clock();
-  err = embedlet_search(bench_store, emb, 5, true, EMBEDLET_SINGLE_THREAD,
-                        results, &result_count);
+  for (int i = 0; i < 20; i++) {
+    err = embedlet_search(bench_store, emb, 5, true, EMBEDLET_SINGLE_THREAD,
+                          results, &result_count);
+  }
   double search_single_time = (double)(clock() - search_start) / CLOCKS_PER_SEC;
   if (err != EMBEDLET_OK) {
     fprintf(stderr, "Search failed: %d\n", err);
@@ -288,9 +313,11 @@ int main(void) {
   }
 
   /* Time multi-threaded top-5 search */
-  printf("\nTiming multi-threaded top-5 search...\n");
+  printf("\nTiming multi-threaded top-5 search (20x)...\n");
   search_start = clock();
-  err = embedlet_search(bench_store, emb, 5, true, 2, results, &result_count);
+  for (int i = 0; i < 20; i++) {
+    err = embedlet_search(bench_store, emb, 5, true, 2, results, &result_count);
+  }
   double search_multi_time = (double)(clock() - search_start) / CLOCKS_PER_SEC;
   if (err != EMBEDLET_OK) {
     fprintf(
@@ -349,6 +376,9 @@ int main(void) {
   }
 
   free(templates);
+
+  /* Free benchmark buffer */
+  free(emb);
 
   /* Cleanup benchmark file */
   remove(STORE_PATH);
